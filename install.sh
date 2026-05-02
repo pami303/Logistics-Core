@@ -45,7 +45,9 @@ echo -e "${GREEN} ENTER YOUR LICENCE KEY${NC}"
 echo -e "${CYAN}==================================================${NC}"
 echo "Paste your RS256 licence token below."
 echo "(Press ENTER, then press CTRL+D when finished):"
-LIC_KEY=$(cat)
+
+# FIX: Force 'cat' to read from the terminal, preventing curl pipe interference
+LIC_KEY=$(cat </dev/tty)
 echo "$LIC_KEY" > license.key
 
 echo -e "\n${YELLOW}Verifying licence signature...${NC}"
@@ -71,8 +73,9 @@ echo -e "\n${CYAN}==================================================${NC}"
 echo -e "${GREEN}Licence verified. Proceeding to configuration.${NC}"
 echo -e "${CYAN}==================================================${NC}"
 
-read -p "Enter your Telegram Bot Token: " TG_TOKEN
-read -p "Enter your Mapbox API Token:   " MB_TOKEN
+# FIX: Force 'read' to listen to terminal, so it doesn't skip in curl | bash
+read -p "Enter your Telegram Bot Token: " TG_TOKEN </dev/tty
+read -p "Enter your Mapbox API Token:   " MB_TOKEN </dev/tty
 
 echo "TELEGRAM_TOKEN=$TG_TOKEN" > .env
 echo "MAPBOX_TOKEN=$MB_TOKEN" >> .env
