@@ -77,18 +77,19 @@ else
 
     if [[ -z "$PY311" ]]; then
         # ---- Method B: deadsnakes PPA (Ubuntu 20.04 / 24.04) ----
-        log_info "Method B: adding deadsnakes PPA via GPG key..."
+        # Uses HTTPS key fetch from Launchpad — avoids keyserver timeouts
+        # which are common on fresh cloud instances.
+        log_info "Method B: adding deadsnakes PPA via HTTPS key fetch..."
 
-        sudo apt-get install -y -q gpg gpg-agent dirmngr > /dev/null 2>&1 || true
+        sudo apt-get install -y -q gpg curl > /dev/null 2>&1 || true
 
-        # Add PPA key manually — more reliable than add-apt-repository on fresh instances
-        sudo gpg --no-default-keyring \
-            --keyring /usr/share/keyrings/deadsnakes.gpg \
-            --keyserver hkp://keyserver.ubuntu.com:80 \
-            --recv-keys F23C5A6CF475977595C89F51BA6932366A755776 > /dev/null 2>&1
+        CODENAME=$(lsb_release -sc 2>/dev/null || echo "jammy")
 
-        if [[ $? -eq 0 ]]; then
-            CODENAME=$(lsb_release -sc 2>/dev/null || echo "jammy")
+        # Fetch GPG key over HTTPS (reliable, no keyserver dependency)
+        curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
+            | sudo gpg --dearmor -o /usr/share/keyrings/deadsnakes.gpg 2>/dev/null
+
+        if [[ $? -eq 0 && -s /usr/share/keyrings/deadsnakes.gpg ]]; then
             echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu $CODENAME main" \
                 | sudo tee /etc/apt/sources.list.d/deadsnakes.list > /dev/null
             sudo apt-get update -y -q > /dev/null 2>&1
@@ -97,7 +98,8 @@ else
         fi
 
         if [[ -z "$PY311" ]]; then
-            log_warn "GPG key method failed — trying add-apt-repository fallback..."
+            # Sub-fallback: classic add-apt-repository
+            log_warn "HTTPS key fetch failed — trying add-apt-repository..."
             sudo add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1 || true
             sudo apt-get update -y -q > /dev/null 2>&1
             sudo apt-get install -y -q python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1
