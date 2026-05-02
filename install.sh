@@ -101,8 +101,22 @@ else
         #      trusted.gpg.d and the old add-apt-repository key injection) ----
         log_info "Method B: adding deadsnakes PPA (modern GPG practice)..."
 
-        CODENAME=$(lsb_release -sc 2>/dev/null || grep VERSION_CODENAME /etc/os-release | cut -d= -f2 || echo "noble")
+        CODENAME=$(lsb_release -sc 2>/dev/null \
+            || grep VERSION_CODENAME /etc/os-release | cut -d= -f2 \
+            || echo "noble")
         sudo mkdir -p "$KEYRINGS_DIR"
+
+        # ---- IMPORTANT: always wipe any leftover key file from a previous
+        #      failed run before writing a new one.  A prior partial write
+        #      can produce a non-empty but corrupt .gpg that passes the -s
+        #      size test yet makes apt-get update fail silently.
+        sudo rm -f "$DEADSNAKES_GPG"
+
+        # Also remove any stale deadsnakes sources list left over from a
+        # previous run that used a different (or no) signed-by path — having
+        # two entries for the same PPA causes apt-get update to error.
+        sudo rm -f /etc/apt/sources.list.d/deadsnakes*.list \
+                   /etc/apt/trusted.gpg.d/deadsnakes*.gpg 2>/dev/null || true
 
         # Try fetching the key from multiple sources in order of reliability.
         # 1) HTTPS REST endpoint  (no HKP firewall issues, port 443)
@@ -116,14 +130,20 @@ else
             "https://keys.openpgp.org/vks/v1/by-fingerprint/${DEADSNAKES_FINGERPRINT}"
         do
             log_info "  Trying key source: $(echo "$KEY_URL" | cut -d/ -f1-3)..."
+
+            # Write to a temp file first so a failed fetch never leaves a
+            # partial/corrupt file at $DEADSNAKES_GPG.
+            TMP_GPG=$(mktemp)
             if curl -fsSL --max-time 15 "$KEY_URL" \
-                    | sudo gpg --dearmor -o "$DEADSNAKES_GPG" 2>/dev/null \
-                && [[ -s "$DEADSNAKES_GPG" ]]; then
+                    | sudo gpg --dearmor -o "$TMP_GPG" 2>/dev/null \
+               && [[ -s "$TMP_GPG" ]]; then
+                sudo mv "$TMP_GPG" "$DEADSNAKES_GPG"
+                sudo chmod 644 "$DEADSNAKES_GPG"
                 KEY_FETCHED=true
                 log_ok "  Key fetched successfully"
                 break
             fi
-            sudo rm -f "$DEADSNAKES_GPG"   # remove any empty/corrupt file
+            sudo rm -f "$TMP_GPG" "$DEADSNAKES_GPG"
         done
 
         if $KEY_FETCHED; then
@@ -134,23 +154,44 @@ https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${CODENAME} main" \
                 | sudo tee /etc/apt/sources.list.d/deadsnakes.list > /dev/null
 
             sudo apt-get update -y -q > /dev/null 2>&1
-            sudo apt-get install -y -q python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1
-            PY311=$(command -v python3.11 2>/dev/null || true)
+            if sudo apt-get install -y -q python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1; then
+                PY311=$(command -v python3.11 2>/dev/null || true)
+            else
+                # apt-get install failed — show why before falling through
+                log_warn "deadsnakes apt install failed — stderr follows:"
+                sudo apt-get install -y python3.11 python3.11-venv python3.11-dev 2>&1 | head -20 || true
+            fi
         fi
 
         if [[ -z "$PY311" ]]; then
-            # Sub-fallback: add-apt-repository (DEBIAN_FRONTEND set above so
-            # it won't block on interactive prompts) ----
-            log_warn "Direct key fetch failed — trying add-apt-repository fallback..."
-            sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1 || true
+            # Sub-fallback: add-apt-repository
+            # Only reached if every key URL above truly failed (network issue).
+            log_warn "Key fetch failed — trying add-apt-repository fallback..."
 
-            # Re-key using /etc/apt/keyrings/ if add-apt-repository put the
-            # key in the deprecated trusted.gpg location (Ubuntu 24.04 bug)
-            if [[ -f /etc/apt/trusted.gpg.d/deadsnakes*.gpg ]]; then
-                sudo cp /etc/apt/trusted.gpg.d/deadsnakes*.gpg "$DEADSNAKES_GPG" 2>/dev/null || true
-                # Patch the sources line to use signed-by
-                sudo sed -i "s|deb https://ppa.launchpadcontent.net/deadsnakes|deb [arch=$(dpkg --print-architecture) signed-by=${DEADSNAKES_GPG}] https://ppa.launchpadcontent.net/deadsnakes|" \
-                    /etc/apt/sources.list.d/deadsnakes*.list 2>/dev/null || true
+            # Clean slate again before add-apt-repository writes its own files
+            sudo rm -f /etc/apt/sources.list.d/deadsnakes*.list \
+                       /etc/apt/trusted.gpg.d/deadsnakes*.gpg \
+                       "$DEADSNAKES_GPG" 2>/dev/null || true
+
+            sudo DEBIAN_FRONTEND=noninteractive \
+                add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1 || true
+
+            # add-apt-repository on Ubuntu 24.04 still drops the key into the
+            # deprecated trusted.gpg.d — migrate it to /etc/apt/keyrings/ and
+            # patch the sources line to use signed-by= so apt doesn't warn.
+            LEGACY_GPG=$(ls /etc/apt/trusted.gpg.d/deadsnakes*.gpg 2>/dev/null | head -1 || true)
+            if [[ -n "$LEGACY_GPG" ]]; then
+                sudo cp "$LEGACY_GPG" "$DEADSNAKES_GPG"
+                sudo chmod 644 "$DEADSNAKES_GPG"
+                sudo rm -f "$LEGACY_GPG"
+                # Patch whatever sources file add-apt-repository wrote
+                SOURCES_FILE=$(ls /etc/apt/sources.list.d/deadsnakes*.list 2>/dev/null | head -1 || true)
+                if [[ -n "$SOURCES_FILE" ]]; then
+                    ARCH=$(dpkg --print-architecture)
+                    sudo sed -i \
+                        "s|^deb |deb [arch=${ARCH} signed-by=${DEADSNAKES_GPG}] |" \
+                        "$SOURCES_FILE" 2>/dev/null || true
+                fi
             fi
 
             sudo apt-get update -y -q > /dev/null 2>&1
