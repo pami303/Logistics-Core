@@ -23,8 +23,9 @@ ZIP_PATH="$(pwd)/core.zip"
 wget -qO "$ZIP_PATH" "$ZIP_URL" || { echo -e "${RED}Download failed. Please check the ZIP_URL and your network connection.${NC}"; exit 1; }
 
 sudo apt update -y -q > /dev/null 2>&1
-# FIX: Added python3-dev, libffi-dev, and libssl-dev to prevent cryptography segfaults
-sudo apt install unzip python3-pip python3-venv python3-dev libffi-dev libssl-dev -y -q > /dev/null 2>&1
+
+# FIX: Install OS-native versions of cryptography, jwt, and psutil so they perfectly match your server's kernel, avoiding Segfaults.
+sudo apt install unzip python3-pip python3-venv python3-dev python3-cryptography python3-jwt python3-psutil -y -q > /dev/null 2>&1
 
 sudo rm -rf /opt/logistics_bot
 sudo unzip -q "$ZIP_PATH" -d /opt/logistics_bot
@@ -34,11 +35,13 @@ cd /opt/logistics_bot || exit
 # 2. ISOLATED PYTHON ENVIRONMENT
 # ==================================================
 echo -e "${YELLOW}[2/5] Creating isolated Python environment...${NC}"
-python3 -m venv venv
 
-# FIX: Upgrade pip tools first, and use explicit paths instead of 'source activate'
+# FIX: Allow the venv to use the perfectly compiled OS-level packages we just installed
+python3 -m venv --system-site-packages venv
+
+# FIX: Only install pure-python packages via pip. C-extensions are handled by apt above.
 ./venv/bin/python -m pip install -q --upgrade pip setuptools wheel
-./venv/bin/python -m pip install -q python-telegram-bot httpx python-dotenv aiofiles PyJWT cryptography psutil rich
+./venv/bin/python -m pip install -q python-telegram-bot httpx python-dotenv aiofiles rich
 
 # ==================================================
 # 3. LICENCE VALIDATION
@@ -49,13 +52,11 @@ echo -e "${CYAN}==================================================${NC}"
 echo "Paste your RS256 licence token below."
 echo "(Press ENTER, then press CTRL+D when finished):"
 
-# FIX: Read from tty AND strip any hidden whitespace/newlines that might crash the Python C-extension
 LIC_KEY=$(cat </dev/tty | tr -d '[:space:]')
 echo -n "$LIC_KEY" > license.key
 
 echo -e "\n${YELLOW}Verifying licence signature...${NC}"
 
-# FIX: Use explicit venv path to run the file
 ./venv/bin/python license.py
 
 if [ $? -ne 0 ]; then
@@ -90,7 +91,6 @@ echo -e "\n${YELLOW}[3/5] Setting up the terminal dashboard...${NC}"
 sudo bash -c "cat > /usr/local/bin/dashboard" << EOL
 #!/bin/bash
 cd /opt/logistics_bot
-# Explicit path here too just to be safe
 ./venv/bin/python dashboard.py
 EOL
 sudo chmod +x /usr/local/bin/dashboard
