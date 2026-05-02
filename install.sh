@@ -23,7 +23,8 @@ ZIP_PATH="$(pwd)/core.zip"
 wget -qO "$ZIP_PATH" "$ZIP_URL" || { echo -e "${RED}Download failed. Please check the ZIP_URL and your network connection.${NC}"; exit 1; }
 
 sudo apt update -y -q > /dev/null 2>&1
-sudo apt install unzip python3-pip python3-venv -y -q > /dev/null 2>&1
+# FIX: Added python3-dev, libffi-dev, and libssl-dev to prevent cryptography segfaults
+sudo apt install unzip python3-pip python3-venv python3-dev libffi-dev libssl-dev -y -q > /dev/null 2>&1
 
 sudo rm -rf /opt/logistics_bot
 sudo unzip -q "$ZIP_PATH" -d /opt/logistics_bot
@@ -34,8 +35,10 @@ cd /opt/logistics_bot || exit
 # ==================================================
 echo -e "${YELLOW}[2/5] Creating isolated Python environment...${NC}"
 python3 -m venv venv
-source venv/bin/activate
-pip install -q python-telegram-bot httpx python-dotenv aiofiles PyJWT cryptography psutil rich
+
+# FIX: Upgrade pip tools first, and use explicit paths instead of 'source activate'
+./venv/bin/python -m pip install -q --upgrade pip setuptools wheel
+./venv/bin/python -m pip install -q python-telegram-bot httpx python-dotenv aiofiles PyJWT cryptography psutil rich
 
 # ==================================================
 # 3. LICENCE VALIDATION
@@ -46,13 +49,14 @@ echo -e "${CYAN}==================================================${NC}"
 echo "Paste your RS256 licence token below."
 echo "(Press ENTER, then press CTRL+D when finished):"
 
-# FIX: Force 'cat' to read from the terminal, preventing curl pipe interference
-LIC_KEY=$(cat </dev/tty)
-echo "$LIC_KEY" > license.key
+# FIX: Read from tty AND strip any hidden whitespace/newlines that might crash the Python C-extension
+LIC_KEY=$(cat </dev/tty | tr -d '[:space:]')
+echo -n "$LIC_KEY" > license.key
 
 echo -e "\n${YELLOW}Verifying licence signature...${NC}"
 
-python3 license.py
+# FIX: Use explicit venv path to run the file
+./venv/bin/python license.py
 
 if [ $? -ne 0 ]; then
     echo -e "\n${RED}==================================================${NC}"
@@ -73,7 +77,6 @@ echo -e "\n${CYAN}==================================================${NC}"
 echo -e "${GREEN}Licence verified. Proceeding to configuration.${NC}"
 echo -e "${CYAN}==================================================${NC}"
 
-# FIX: Force 'read' to listen to terminal, so it doesn't skip in curl | bash
 read -p "Enter your Telegram Bot Token: " TG_TOKEN </dev/tty
 read -p "Enter your Mapbox API Token:   " MB_TOKEN </dev/tty
 
@@ -87,8 +90,8 @@ echo -e "\n${YELLOW}[3/5] Setting up the terminal dashboard...${NC}"
 sudo bash -c "cat > /usr/local/bin/dashboard" << EOL
 #!/bin/bash
 cd /opt/logistics_bot
-source venv/bin/activate
-python3 dashboard.py
+# Explicit path here too just to be safe
+./venv/bin/python dashboard.py
 EOL
 sudo chmod +x /usr/local/bin/dashboard
 
@@ -101,7 +104,7 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=/opt/logistics_bot
-ExecStart=/opt/logistics_bot/venv/bin/python3 main.py
+ExecStart=/opt/logistics_bot/venv/bin/python main.py
 Restart=always
 RestartSec=5
 
