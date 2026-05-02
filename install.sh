@@ -1,13 +1,20 @@
 #!/bin/bash
 # ==================================================
-# LOGISTICS ENGINE — INSTALLER v2
-# Robust edition: every dependency has a fallback chain,
-# errors are visible, nothing fails silently.
+# LOGISTICS ENGINE — INSTALLER v3
+# Ubuntu 24.04 (noble) hardened edition:
+#   • Deadsnakes-first (standard apt skipped on noble)
+#   • /etc/apt/keyrings/ + signed-by GPG practice
+#   • Multi-keyserver fallback with port-80 backup
+#   • DEBIAN_FRONTEND=noninteractive throughout
+#   • uv for fast venv + dependency install
+#   • Parallel apt + pip/uv optimisations
 # ==================================================
 
 # NOTE: We intentionally do NOT use `set -e` here.
 # Every command is checked explicitly so failures are
 # caught with a clear message instead of a silent exit.
+
+export DEBIAN_FRONTEND=noninteractive
 
 # --- Terminal Colors ---
 GREEN='\033[0;32m'
@@ -19,6 +26,10 @@ NC='\033[0m'
 
 ZIP_URL="https://github.com/pami303/Logistics-Core/raw/refs/heads/main/core.zip"
 ZIP_PATH="/tmp/core.zip"
+
+DEADSNAKES_FINGERPRINT="F23C5A6CF475977595C89F51BA6932366A755776"
+KEYRINGS_DIR="/etc/apt/keyrings"
+DEADSNAKES_GPG="$KEYRINGS_DIR/deadsnakes.gpg"
 
 # ==================================================
 # HELPERS
@@ -48,9 +59,14 @@ echo -e "${CYAN}╚════════════════════�
 # ==================================================
 log_section "1/6" "Installing base system packages"
 
+# Single update pass — parallelism via apt's own HTTP pipeline
 sudo apt-get update -y -q > /dev/null 2>&1 || log_warn "apt update had warnings — continuing anyway"
 
-BASE_PKGS="unzip wget curl gnupg ca-certificates software-properties-common build-essential libssl-dev libffi-dev python3-pip"
+# gnupg2 is what Ubuntu 24.04 ships; curl is needed for key fetch below.
+# build-essential / libssl-dev / libffi-dev are only needed for source builds
+# so we defer them to the source-build fallback (Method C) to save time on
+# the happy path.
+BASE_PKGS="unzip wget curl gnupg2 ca-certificates software-properties-common"
 
 log_info "Installing base packages..."
 sudo apt-get install -y -q $BASE_PKGS > /dev/null 2>&1
@@ -61,7 +77,10 @@ fi
 log_ok "Base packages ready"
 
 # ==================================================
-# STEP 2 — PYTHON 3.11 (3-method fallback chain)
+# STEP 2 — PYTHON 3.11
+# Ubuntu 24.04 (noble): python3.11 is NOT in the universe repo — deadsnakes
+# is the only apt-based path. Method A (plain apt) is left as a fast probe
+# but will almost always be a no-op on noble; it costs one apt-cache lookup.
 # ==================================================
 log_section "2/6" "Ensuring Python 3.11 is available"
 
@@ -70,37 +89,70 @@ PY311=$(command -v python3.11 2>/dev/null || true)
 if [[ -n "$PY311" ]]; then
     log_ok "Python 3.11 already installed: $PY311"
 else
-    # ---- Method A: standard apt (works on Ubuntu 22.04) ----
-    log_info "Method A: trying standard apt repos..."
+    # ---- Method A: plain apt probe (succeeds on 22.04, nearly always a
+    #      no-op on 24.04 but costs almost nothing to try) ----
+    log_info "Method A: probing standard apt repos..."
     sudo apt-get install -y -q python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1
     PY311=$(command -v python3.11 2>/dev/null || true)
 
     if [[ -z "$PY311" ]]; then
-        # ---- Method B: deadsnakes PPA (Ubuntu 20.04 / 24.04) ----
-        # Uses HTTPS key fetch from Launchpad — avoids keyserver timeouts
-        # which are common on fresh cloud instances.
-        log_info "Method B: adding deadsnakes PPA via HTTPS key fetch..."
+        # ---- Method B: deadsnakes PPA with /etc/apt/keyrings/ + signed-by
+        #      (correct Ubuntu 24.04 GPG practice; avoids the deprecated
+        #      trusted.gpg.d and the old add-apt-repository key injection) ----
+        log_info "Method B: adding deadsnakes PPA (modern GPG practice)..."
 
-        sudo apt-get install -y -q gpg curl > /dev/null 2>&1 || true
+        CODENAME=$(lsb_release -sc 2>/dev/null || grep VERSION_CODENAME /etc/os-release | cut -d= -f2 || echo "noble")
+        sudo mkdir -p "$KEYRINGS_DIR"
 
-        CODENAME=$(lsb_release -sc 2>/dev/null || echo "jammy")
+        # Try fetching the key from multiple sources in order of reliability.
+        # 1) HTTPS REST endpoint  (no HKP firewall issues, port 443)
+        # 2) HKP port 80 fallback (port 11371 is often blocked on cloud VMs)
+        # 3) keys.openpgp.org      (independent network, good uptime)
+        KEY_FETCHED=false
 
-        # Fetch GPG key over HTTPS (reliable, no keyserver dependency)
-        curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
-            | sudo gpg --dearmor -o /usr/share/keyrings/deadsnakes.gpg 2>/dev/null
+        for KEY_URL in \
+            "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${DEADSNAKES_FINGERPRINT}" \
+            "http://keyserver.ubuntu.com:80/pks/lookup?op=get&search=0x${DEADSNAKES_FINGERPRINT}" \
+            "https://keys.openpgp.org/vks/v1/by-fingerprint/${DEADSNAKES_FINGERPRINT}"
+        do
+            log_info "  Trying key source: $(echo "$KEY_URL" | cut -d/ -f1-3)..."
+            if curl -fsSL --max-time 15 "$KEY_URL" \
+                    | sudo gpg --dearmor -o "$DEADSNAKES_GPG" 2>/dev/null \
+                && [[ -s "$DEADSNAKES_GPG" ]]; then
+                KEY_FETCHED=true
+                log_ok "  Key fetched successfully"
+                break
+            fi
+            sudo rm -f "$DEADSNAKES_GPG"   # remove any empty/corrupt file
+        done
 
-        if [[ $? -eq 0 && -s /usr/share/keyrings/deadsnakes.gpg ]]; then
-            echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu $CODENAME main" \
+        if $KEY_FETCHED; then
+            # Correct Ubuntu 24.04 practice: signed-by= scopes the key to
+            # this repo only; arch= avoids "skipping non-matching" warnings.
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=${DEADSNAKES_GPG}] \
+https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${CODENAME} main" \
                 | sudo tee /etc/apt/sources.list.d/deadsnakes.list > /dev/null
+
             sudo apt-get update -y -q > /dev/null 2>&1
             sudo apt-get install -y -q python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1
             PY311=$(command -v python3.11 2>/dev/null || true)
         fi
 
         if [[ -z "$PY311" ]]; then
-            # Sub-fallback: classic add-apt-repository
-            log_warn "HTTPS key fetch failed — trying add-apt-repository..."
-            sudo add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1 || true
+            # Sub-fallback: add-apt-repository (DEBIAN_FRONTEND set above so
+            # it won't block on interactive prompts) ----
+            log_warn "Direct key fetch failed — trying add-apt-repository fallback..."
+            sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1 || true
+
+            # Re-key using /etc/apt/keyrings/ if add-apt-repository put the
+            # key in the deprecated trusted.gpg location (Ubuntu 24.04 bug)
+            if [[ -f /etc/apt/trusted.gpg.d/deadsnakes*.gpg ]]; then
+                sudo cp /etc/apt/trusted.gpg.d/deadsnakes*.gpg "$DEADSNAKES_GPG" 2>/dev/null || true
+                # Patch the sources line to use signed-by
+                sudo sed -i "s|deb https://ppa.launchpadcontent.net/deadsnakes|deb [arch=$(dpkg --print-architecture) signed-by=${DEADSNAKES_GPG}] https://ppa.launchpadcontent.net/deadsnakes|" \
+                    /etc/apt/sources.list.d/deadsnakes*.list 2>/dev/null || true
+            fi
+
             sudo apt-get update -y -q > /dev/null 2>&1
             sudo apt-get install -y -q python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1
             PY311=$(command -v python3.11 2>/dev/null || true)
@@ -108,11 +160,13 @@ else
     fi
 
     if [[ -z "$PY311" ]]; then
-        # ---- Method C: compile from source (~8 min, always works) ----
+        # ---- Method C: compile from source (~8 min, last resort) ----
         log_warn "PPA methods failed. Compiling Python 3.11 from source..."
         log_warn "This will take approximately 8-10 minutes. Please wait..."
 
+        # Install build deps (deferred from Step 1 to keep happy-path fast)
         sudo apt-get install -y -q \
+            build-essential libssl-dev libffi-dev python3-pip \
             zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
             libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
             liblzma-dev > /dev/null 2>&1 || true
@@ -128,7 +182,9 @@ else
         cd Python-3.11.9 || fatal "Could not enter Python source directory"
 
         log_info "Configuring..."
-        ./configure --enable-optimizations --prefix=/usr/local > /dev/null 2>&1 \
+        # --enable-optimizations adds ~30% speed but doubles compile time;
+        # use --with-lto as a lighter alternative.
+        ./configure --with-lto --prefix=/usr/local > /dev/null 2>&1 \
             || fatal "Python ./configure failed"
 
         log_info "Compiling (please wait ~8 minutes)..."
@@ -149,11 +205,11 @@ fi
 
 [[ -z "$PY311" ]] && fatal "All three Python 3.11 installation methods failed.\nPlease install Python 3.11 manually and re-run this installer."
 
-# Ensure venv module is available
+# Ensure venv module is available (deadsnakes splits it into a separate pkg)
 if ! python3.11 -m venv --help > /dev/null 2>&1; then
     log_info "Installing python3.11-venv module..."
     sudo apt-get install -y -q python3.11-venv > /dev/null 2>&1 || \
-    sudo apt-get install -y -q python3-venv > /dev/null 2>&1 || true
+    sudo apt-get install -y -q python3-venv     > /dev/null 2>&1 || true
 fi
 
 PY_VERSION=$(python3.11 --version 2>&1)
@@ -225,39 +281,58 @@ fi
 
 # ==================================================
 # STEP 5 — PYTHON ENVIRONMENT & DEPENDENCIES
+# Use uv if available (10-100× faster than pip for cold installs);
+# fall back to plain pip otherwise.
 # ==================================================
 log_section "5/6" "Creating Python 3.11 virtual environment"
 
+# Try to install uv (single static binary, very fast)
+UV_BIN=""
+if ! command -v uv > /dev/null 2>&1; then
+    log_info "Installing uv (fast Python package manager)..."
+    curl -fsSL --max-time 20 https://astral.sh/uv/install.sh | sh > /dev/null 2>&1 || true
+    # uv installs to ~/.cargo/bin or ~/.local/bin depending on version
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+fi
+UV_BIN=$(command -v uv 2>/dev/null || true)
+
 log_info "Initialising venv..."
-python3.11 -m venv venv \
-    || fatal "python3.11 -m venv failed.\nTry: sudo apt-get install -y python3.11-venv"
+if [[ -n "$UV_BIN" ]]; then
+    "$UV_BIN" venv --python python3.11 venv > /dev/null 2>&1 \
+        || python3.11 -m venv venv \
+        || fatal "venv creation failed.\nTry: sudo apt-get install -y python3.11-venv"
+else
+    python3.11 -m venv venv \
+        || fatal "python3.11 -m venv failed.\nTry: sudo apt-get install -y python3.11-venv"
+fi
 log_ok "Virtual environment created"
 
-log_info "Upgrading pip / setuptools / wheel..."
-./venv/bin/python -m pip install -q --upgrade pip setuptools wheel \
-    || fatal "pip upgrade failed"
+DEPS="cryptography python-telegram-bot httpx python-dotenv aiofiles rich PyJWT[crypto] psutil"
 
-log_info "Installing all dependencies (using pre-built wheels)..."
-# cryptography wheels >= 3.5 bundle their own OpenSSL — no source build needed.
-# The original segfault was a Python version mismatch with PyArmor, which is
-# now fixed by enforcing Python 3.11 above.
-./venv/bin/python -m pip install -q \
-    "cryptography" \
-    "python-telegram-bot" \
-    "httpx" \
-    "python-dotenv" \
-    "aiofiles" \
-    "rich" \
-    "PyJWT[crypto]" \
-    "psutil"
+if [[ -n "$UV_BIN" ]]; then
+    log_info "Installing dependencies via uv (fast path)..."
+    # uv resolves and installs in parallel; --no-cache is omitted so repeated
+    # runs benefit from the local uv cache (~/.cache/uv).
+    "$UV_BIN" pip install --python ./venv/bin/python $DEPS > /dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        log_warn "uv silent install failed — retrying with output..."
+        "$UV_BIN" pip install --python ./venv/bin/python $DEPS \
+            || fatal "Dependency installation failed. See output above."
+    fi
+else
+    log_info "Upgrading pip / setuptools / wheel..."
+    ./venv/bin/python -m pip install -q --upgrade pip setuptools wheel \
+        || fatal "pip upgrade failed"
 
-if [[ $? -ne 0 ]]; then
-    log_warn "Silent install failed — retrying with output visible..."
-    ./venv/bin/python -m pip install \
-        "cryptography" \
-        "python-telegram-bot" "httpx" "python-dotenv" \
-        "aiofiles" "rich" "PyJWT[crypto]" "psutil" \
-        || fatal "Dependency installation failed. See output above."
+    log_info "Installing dependencies via pip..."
+    # --only-binary :all: avoids source builds; --prefer-binary is a lighter
+    # hint that still allows source if no wheel exists.
+    ./venv/bin/python -m pip install -q --prefer-binary $DEPS
+    if [[ $? -ne 0 ]]; then
+        log_warn "Silent pip install failed — retrying with output..."
+        ./venv/bin/python -m pip install --prefer-binary $DEPS \
+            || fatal "Dependency installation failed. See output above."
+    fi
 fi
 log_ok "All dependencies installed"
 
@@ -265,7 +340,7 @@ log_info "Running import verification checks..."
 ./venv/bin/python -c "import jwt" \
     || fatal "PyJWT import failed after install."
 ./venv/bin/python -c "from cryptography.hazmat.primitives.asymmetric import rsa" \
-    || fatal "cryptography import failed after source build."
+    || fatal "cryptography import failed after install."
 ./venv/bin/python -c "from pyarmor_runtime_000000 import __pyarmor__" \
     || fatal "PyArmor runtime import failed.\nVerify pyarmor_runtime.so is the linux.x86_64 build for Python 3.11."
 log_ok "All critical imports verified (jwt, cryptography, pyarmor_runtime)"
