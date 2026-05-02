@@ -133,16 +133,24 @@ else
 
             # Write to a temp file first so a failed fetch never leaves a
             # partial/corrupt file at $DEADSNAKES_GPG.
-            TMP_GPG=$(mktemp)
-            if curl -fsSL --max-time 15 "$KEY_URL" \
-                    | sudo gpg --dearmor -o "$TMP_GPG" 2>/dev/null \
+            # Two-step fetch: download first, then dearmor separately.
+            # Piping curl|gpg means bash only sees gpg's exit code — a
+            # network failure in curl is silently ignored if gpg exits 0
+            # on an empty/partial input.
+            TMP_ASC=$(sudo mktemp)
+            TMP_GPG=$(sudo mktemp)
+            if curl -fsSL --max-time 15 "$KEY_URL" -o "$TMP_ASC" 2>/dev/null \
+               && [[ -s "$TMP_ASC" ]] \
+               && sudo gpg --dearmor -o "$TMP_GPG" < "$TMP_ASC" 2>/dev/null \
                && [[ -s "$TMP_GPG" ]]; then
                 sudo mv "$TMP_GPG" "$DEADSNAKES_GPG"
                 sudo chmod 644 "$DEADSNAKES_GPG"
                 KEY_FETCHED=true
+                rm -f "$TMP_ASC"
                 log_ok "  Key fetched successfully"
                 break
             fi
+            rm -f "$TMP_ASC"
             sudo rm -f "$TMP_GPG" "$DEADSNAKES_GPG"
         done
 
@@ -153,7 +161,10 @@ else
 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${CODENAME} main" \
                 | sudo tee /etc/apt/sources.list.d/deadsnakes.list > /dev/null
 
-            sudo apt-get update -y -q > /dev/null 2>&1
+            if ! sudo apt-get update -y -q > /dev/null 2>&1; then
+                log_warn "apt-get update failed after adding deadsnakes — showing errors:"
+                sudo apt-get update 2>&1 | tail -10 || true
+            fi
             if sudo apt-get install -y -q python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1; then
                 PY311=$(command -v python3.11 2>/dev/null || true)
             else
@@ -179,13 +190,13 @@ https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${CODENAME} main" \
             # add-apt-repository on Ubuntu 24.04 still drops the key into the
             # deprecated trusted.gpg.d — migrate it to /etc/apt/keyrings/ and
             # patch the sources line to use signed-by= so apt doesn't warn.
-            LEGACY_GPG=$(ls /etc/apt/trusted.gpg.d/deadsnakes*.gpg 2>/dev/null | head -1 || true)
+            LEGACY_GPG=$(find /etc/apt/trusted.gpg.d/ -maxdepth 1 -name "deadsnakes*.gpg" -print 2>/dev/null | head -1 || true)
             if [[ -n "$LEGACY_GPG" ]]; then
                 sudo cp "$LEGACY_GPG" "$DEADSNAKES_GPG"
                 sudo chmod 644 "$DEADSNAKES_GPG"
                 sudo rm -f "$LEGACY_GPG"
                 # Patch whatever sources file add-apt-repository wrote
-                SOURCES_FILE=$(ls /etc/apt/sources.list.d/deadsnakes*.list 2>/dev/null | head -1 || true)
+                SOURCES_FILE=$(find /etc/apt/sources.list.d/ -maxdepth 1 -name "deadsnakes*.list" -print 2>/dev/null | head -1 || true)
                 if [[ -n "$SOURCES_FILE" ]]; then
                     ARCH=$(dpkg --print-architecture)
                     sudo sed -i \
@@ -262,7 +273,7 @@ log_ok "Python 3.11 ready: $PY_VERSION"
 log_section "3/6" "Downloading application files"
 
 log_info "Fetching core.zip from GitHub..."
-wget -q -O "$ZIP_PATH" "$ZIP_URL"
+wget -q --tries=3 --timeout=60 -O "$ZIP_PATH" "$ZIP_URL"
 [[ $? -ne 0 ]] && fatal "Download failed.\nURL: $ZIP_URL\nCheck network and GitHub repo availability."
 log_ok "Download complete"
 
@@ -274,13 +285,17 @@ log_info "Extracting..."
 sudo unzip -q "$ZIP_PATH" -d "$TMP_UNZIP" \
     || fatal "Failed to extract core.zip. The file may be corrupted."
 
-# Auto-flatten single wrapper folder if present
-TOP_COUNT=$(ls "$TMP_UNZIP" | wc -l)
-TOP_ENTRY=$(ls "$TMP_UNZIP" | head -1)
+# Auto-flatten single wrapper folder if present.
+# Use a bash glob array instead of parsing `ls` output — ls piped into
+# wc/head is unsafe when filenames contain spaces or glob characters.
+mapfile -t TOP_ENTRIES < <(find "$TMP_UNZIP" -mindepth 1 -maxdepth 1)
+TOP_COUNT=${#TOP_ENTRIES[@]}
+TOP_ENTRY="${TOP_ENTRIES[0]}"
 
-if [[ "$TOP_COUNT" -eq 1 && -d "$TMP_UNZIP/$TOP_ENTRY" ]]; then
-    log_info "Detected wrapper folder '$TOP_ENTRY' — flattening..."
-    sudo cp -r "$TMP_UNZIP/$TOP_ENTRY/." /opt/logistics_bot/
+if [[ "$TOP_COUNT" -eq 1 && -d "$TOP_ENTRY" ]]; then
+    FOLDER_NAME=$(basename "$TOP_ENTRY")
+    log_info "Detected wrapper folder '$FOLDER_NAME' — flattening..."
+    sudo cp -r "$TOP_ENTRY/." /opt/logistics_bot/
 else
     sudo cp -r "$TMP_UNZIP/." /opt/logistics_bot/
 fi
@@ -327,13 +342,16 @@ fi
 # ==================================================
 log_section "5/6" "Creating Python 3.11 virtual environment"
 
-# Try to install uv (single static binary, very fast)
+# Try to install uv (single static binary, very fast).
+# Install to /usr/local/bin so it lands on PATH regardless of whether
+# the script runs as root (sudo bash, HOME=/root) or a regular user.
+# The default ~/.local/bin install is not reliable under `sudo bash`
+# because that dir may not be on PATH yet in the root environment.
 UV_BIN=""
 if ! command -v uv > /dev/null 2>&1; then
     log_info "Installing uv (fast Python package manager)..."
-    curl -fsSL --max-time 20 https://astral.sh/uv/install.sh | sh > /dev/null 2>&1 || true
-    # uv installs to ~/.cargo/bin or ~/.local/bin depending on version
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    curl -fsSL --max-time 20 https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin sh > /dev/null 2>&1 || true
 fi
 UV_BIN=$(command -v uv 2>/dev/null || true)
 
@@ -354,10 +372,15 @@ if [[ -n "$UV_BIN" ]]; then
     log_info "Installing dependencies via uv (fast path)..."
     # uv resolves and installs in parallel; --no-cache is omitted so repeated
     # runs benefit from the local uv cache (~/.cache/uv).
-    "$UV_BIN" pip install --python ./venv/bin/python $DEPS > /dev/null 2>&1
+    # uv pip looks for a venv named .venv by default; ours is named
+    # "venv". Point it explicitly via VIRTUAL_ENV so uv installs into
+    # the correct environment without needing --python.
+    VIRTUAL_ENV="$(pwd)/venv" \
+        "$UV_BIN" pip install $DEPS > /dev/null 2>&1
     if [[ $? -ne 0 ]]; then
         log_warn "uv silent install failed — retrying with output..."
-        "$UV_BIN" pip install --python ./venv/bin/python $DEPS \
+        VIRTUAL_ENV="$(pwd)/venv" \
+            "$UV_BIN" pip install $DEPS \
             || fatal "Dependency installation failed. See output above."
     fi
 else
@@ -470,14 +493,14 @@ SERVICE_EOF
 sudo systemctl daemon-reload
 sudo systemctl enable logistics_bot > /dev/null 2>&1
 sudo systemctl start logistics_bot
-log_ok "systemd service started"
+log_info "systemd service start requested (status verified below)"
 
 rm -f "$ZIP_PATH"
 
 # ==================================================
 # FINAL STATUS
 # ==================================================
-sleep 2
+sleep 4
 if sudo systemctl is-active --quiet logistics_bot; then
     echo -e "\n${CYAN}╔══════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}${BOLD}INSTALLATION COMPLETE${NC}${CYAN}                         ║${NC}"
