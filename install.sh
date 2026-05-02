@@ -237,21 +237,12 @@ log_info "Upgrading pip / setuptools / wheel..."
 ./venv/bin/python -m pip install -q --upgrade pip setuptools wheel \
     || fatal "pip upgrade failed"
 
-log_info "Installing cffi (build dependency for cryptography)..."
-./venv/bin/python -m pip install -q cffi \
-    || fatal "cffi installation failed"
-
-log_info "Compiling cryptography from source (prevents OpenSSL segfault — ~1 min)..."
-./venv/bin/python -m pip install -q --no-binary cryptography cryptography
-if [[ $? -ne 0 ]]; then
-    log_warn "Source build failed — showing full output:"
-    ./venv/bin/python -m pip install --no-binary cryptography cryptography
-    fatal "cryptography source build failed. See output above."
-fi
-log_ok "cryptography built from source"
-
-log_info "Installing application dependencies..."
+log_info "Installing all dependencies (using pre-built wheels)..."
+# cryptography wheels >= 3.5 bundle their own OpenSSL — no source build needed.
+# The original segfault was a Python version mismatch with PyArmor, which is
+# now fixed by enforcing Python 3.11 above.
 ./venv/bin/python -m pip install -q \
+    "cryptography" \
     "python-telegram-bot" \
     "httpx" \
     "python-dotenv" \
@@ -263,6 +254,7 @@ log_info "Installing application dependencies..."
 if [[ $? -ne 0 ]]; then
     log_warn "Silent install failed — retrying with output visible..."
     ./venv/bin/python -m pip install \
+        "cryptography" \
         "python-telegram-bot" "httpx" "python-dotenv" \
         "aiofiles" "rich" "PyJWT[crypto]" "psutil" \
         || fatal "Dependency installation failed. See output above."
