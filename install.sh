@@ -24,7 +24,7 @@ wget -qO "$ZIP_PATH" "$ZIP_URL" || { echo -e "${RED}Download failed. Please chec
 
 sudo apt update -y -q > /dev/null 2>&1
 
-# FIX: Install OS-native versions of cryptography, jwt, and psutil so they perfectly match your server's kernel, avoiding Segfaults.
+# FIX: Install OS-native versions of cryptography, jwt, and psutil to prevent Segfaults.
 sudo apt install unzip python3-pip python3-venv python3-dev python3-cryptography python3-jwt python3-psutil -y -q > /dev/null 2>&1
 
 sudo rm -rf /opt/logistics_bot
@@ -36,10 +36,10 @@ cd /opt/logistics_bot || exit
 # ==================================================
 echo -e "${YELLOW}[2/5] Creating isolated Python environment...${NC}"
 
-# FIX: Allow the venv to use the perfectly compiled OS-level packages we just installed
+# FIX: Allow the venv to use the OS-level packages we just installed
 python3 -m venv --system-site-packages venv
 
-# FIX: Only install pure-python packages via pip. C-extensions are handled by apt above.
+# FIX: Only install pure-python packages via pip.
 ./venv/bin/python -m pip install -q --upgrade pip setuptools wheel
 ./venv/bin/python -m pip install -q python-telegram-bot httpx python-dotenv aiofiles rich
 
@@ -52,6 +52,7 @@ echo -e "${CYAN}==================================================${NC}"
 echo "Paste your RS256 licence token below."
 echo "(Press ENTER, then press CTRL+D when finished):"
 
+# FIX: Listen to /dev/tty specifically so `curl | bash` doesn't skip the input
 LIC_KEY=$(cat </dev/tty | tr -d '[:space:]')
 echo -n "$LIC_KEY" > license.key
 
