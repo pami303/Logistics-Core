@@ -138,7 +138,8 @@ KEY_OK=false
 for KEY_URL in \
     "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${DS_FP}" \
     "http://keyserver.ubuntu.com:80/pks/lookup?op=get&search=0x${DS_FP}" \
-    "https://keys.openpgp.org/vks/v1/by-fingerprint/${DS_FP}"
+    "https://keys.openpgp.org/vks/v1/by-fingerprint/${DS_FP}" \
+    "https://launchpad.net/~deadsnakes/+archive/ubuntu/ppa/+archivekey"
 do
     log_info "  Trying: $(echo "$KEY_URL" | cut -d/ -f1-3)..."
 
@@ -157,6 +158,15 @@ do
         continue
     fi
 
+    # Sanity-check: reject HTML error pages that keyservers return on failure.
+    # These are non-empty so the -s size check passes, but gpg --dearmor on
+    # HTML produces a corrupt or zero-byte output file.
+    if head -c 100 "$TMP_ASC" | grep -qiE "<html|<!DOCTYPE|404|403|error"; then
+        log_warn "  Server returned an error page, not a key — skipping"
+        rm -f "$TMP_ASC"
+        continue
+    fi
+
     # Step 2 — dearmor: --batch --yes = fully non-interactive, never prompts
     GPG_RC=0
     gpg --batch --yes --dearmor -o "$TMP_GPG" < "$TMP_ASC" 2>/dev/null \
@@ -169,11 +179,21 @@ do
         continue
     fi
 
+    # Validate the output is a binary GPG keyring, NOT armored ASCII.
+    # If `file` reports "ASCII text" or "PGP public key block" it means
+    # dearmor failed silently — apt will ignore it with "unsupported filetype".
+    FILETYPE=$(file -b "$TMP_GPG" 2>/dev/null || echo "unknown")
+    if echo "$FILETYPE" | grep -qiE "ASCII text|PGP public key block|HTML|XML"; then
+        log_warn "  Output is not binary GPG keyring (got: $FILETYPE) — skipping"
+        rm -f "$TMP_GPG"
+        continue
+    fi
+
     # Success — move into place
     mv "$TMP_GPG" "$DS_GPG"
     chmod 644 "$DS_GPG"
     KEY_OK=true
-    log_ok "  Key written to $DS_GPG"
+    log_ok "  Key written: $DS_GPG ($FILETYPE)"
     break
 done
 
@@ -188,32 +208,59 @@ https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${CODENAME} main" \
     APT_OUT=$(apt-get update 2>&1)
     APT_RC=$?
 
-    # Check whether apt actually accepted the key for the deadsnakes repo.
-    # If not, "Unable to locate package python3.11" is a red herring —
-    # the real problem is the key was rejected. Mark KEY_OK=false and
-    # fall through to the add-apt-repository sub-fallback.
+    # Always show what apt did with the deadsnakes repo specifically.
+    # "Hit:" = index downloaded OK. "Ign:" = silently skipped (network blip,
+    # clock skew, or bad key). "Err:" = hard error.
+    # This is the most useful diagnostic line in the entire install.
+    DS_LINE=$(echo "$APT_OUT" | grep -i "deadsnakes" | head -5 || true)
+    if [[ -n "$DS_LINE" ]]; then
+        log_info "  apt deadsnakes status: $DS_LINE"
+    else
+        log_warn "  deadsnakes repo not mentioned in apt output (may be issue)"
+    fi
+
     if echo "$APT_OUT" | grep -qiE "deadsnakes.*(NO_PUBKEY|not signed|BADSIG)"; then
         log_warn "  apt rejected the deadsnakes key — output:"
         echo "$APT_OUT" | grep -iE "deadsnakes|NO_PUBKEY|BADSIG|sign" | head -10
         KEY_OK=false
+    elif echo "$APT_OUT" | grep -qiE "^Ign.*deadsnakes|^Err.*deadsnakes"; then
+        log_warn "  apt IGNORED or ERRORED on deadsnakes repo (index not downloaded)"
+        echo "$APT_OUT" | grep -iE "deadsnakes" | head -5
+        KEY_OK=false
     elif [[ $APT_RC -ne 0 ]]; then
-        # Non-zero but no key error — probably an unrelated repo warning
         log_warn "  apt-get update non-zero exit (may be unrelated):"
         echo "$APT_OUT" | grep -i "^E:\|^W:" | head -5 || true
-        # Don't set KEY_OK=false — try the install anyway
+        # Non-fatal for unrelated repos — try install anyway
     fi
 fi
 
 if $KEY_OK; then
-    log_info "  Installing python3.11 packages..."
-    if apt-get install -y -q \
-            python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1; then
-        PY311=$(command -v python3.11 2>/dev/null || true)
-        [[ -n "$PY311" ]] && log_ok "  python3.11 installed via deadsnakes PPA"
+    # Verify the package index was actually populated BEFORE calling install.
+    # apt-get update exits 0 even when deadsnakes was silently skipped (Ign:).
+    # `apt-cache policy` is the only reliable way to confirm a Candidate exists.
+    # Without this check, apt-get install gives the misleading
+    # "E: Unable to locate package python3.11" error even when the key is fine.
+    log_info "  Checking apt-cache for python3.11 candidate..."
+    CANDIDATE=$(apt-cache policy python3.11 2>/dev/null \
+        | grep "Candidate:" | awk '{print $2}')
+
+    if [[ -z "$CANDIDATE" || "$CANDIDATE" == "(none)" ]]; then
+        log_warn "  No installable candidate found (index not populated from PPA)"
+        log_warn "  apt-cache output:"
+        apt-cache policy python3.11 2>&1 | head -10 || true
+        KEY_OK=false   # fall through to add-apt-repository sub-fallback
     else
-        log_warn "  apt-get install failed — showing output:"
-        apt-get install -y python3.11 python3.11-venv python3.11-dev \
-            2>&1 | head -25 || true
+        log_ok "  Candidate found: python3.11 = $CANDIDATE"
+        log_info "  Installing python3.11 packages..."
+        if apt-get install -y -q \
+                python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1; then
+            PY311=$(command -v python3.11 2>/dev/null || true)
+            [[ -n "$PY311" ]] && log_ok "  python3.11 installed via deadsnakes PPA"
+        else
+            log_warn "  apt-get install failed — showing output:"
+            apt-get install -y python3.11 python3.11-venv python3.11-dev \
+                2>&1 | head -25 || true
+        fi
     fi
 fi
 
@@ -252,8 +299,17 @@ if [[ -z "$PY311" ]]; then
     fi
 
     apt-get update -y -q > /dev/null 2>&1
-    apt-get install -y -q \
-        python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1 || true
+
+    # Same candidate check for the add-apt-repository fallback path
+    AAR_CANDIDATE=$(apt-cache policy python3.11 2>/dev/null \
+        | grep "Candidate:" | awk '{print $2}')
+    if [[ -n "$AAR_CANDIDATE" && "$AAR_CANDIDATE" != "(none)" ]]; then
+        log_ok "  Candidate found via add-apt-repository: $AAR_CANDIDATE"
+        apt-get install -y -q \
+            python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1 || true
+    else
+        log_warn "  add-apt-repository fallback: still no candidate — will compile from source"
+    fi
     PY311=$(command -v python3.11 2>/dev/null || true)
 fi
 
