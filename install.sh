@@ -55,14 +55,14 @@ echo -e "${CYAN}╚════════════════════�
 # ══════════════════════════════════════════════════════════════════
 log_section "1/6" "Installing base system packages"
 
-apt-get update -y -q > /dev/null 2>&1 \
+apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=5 -o Acquire::https::Timeout=5 -o Acquire::Retries=1 update -y -q > /dev/null 2>&1 \
     || log_warn "apt update had warnings (non-fatal)"
 
 BASE="unzip wget curl gnupg2 ca-certificates software-properties-common lsb-release"
 log_info "Installing: $BASE"
-if ! apt-get install -y -q $BASE > /dev/null 2>&1; then
+if ! apt-get -o Acquire::ForceIPv4=true install -y -q $BASE > /dev/null 2>&1; then
     log_warn "Quiet install failed — retrying with output:"
-    apt-get install -y $BASE \
+    apt-get -o Acquire::ForceIPv4=true install -y $BASE \
         || fatal "Cannot install base packages.\nCheck your apt sources and network."
 fi
 log_ok "Base packages ready"
@@ -84,7 +84,7 @@ else
 
 # ── Method A: plain apt (works on 22.04; nearly always a no-op on 24.04) ──
 log_info "Method A: probing standard apt repos..."
-apt-get install -y -q python3.11 python3.11-venv python3.11-dev \
+apt-get -o Acquire::ForceIPv4=true install -y -q python3.11 python3.11-venv python3.11-dev \
     > /dev/null 2>&1 || true
 PY311=$(command -v python3.11 2>/dev/null || true)
 
@@ -205,7 +205,7 @@ https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${CODENAME} main" \
         > "$DS_LIST"
 
     log_info "  Running apt-get update..."
-    APT_OUT=$(apt-get update 2>&1)
+    APT_OUT=$(apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=5 -o Acquire::https::Timeout=5 -o Acquire::Retries=1 update 2>&1)
     APT_RC=$?
 
     # Always show what apt did with the deadsnakes repo specifically.
@@ -252,13 +252,13 @@ if $KEY_OK; then
     else
         log_ok "  Candidate found: python3.11 = $CANDIDATE"
         log_info "  Installing python3.11 packages..."
-        if apt-get install -y -q \
+        if apt-get -o Acquire::ForceIPv4=true install -y -q \
                 python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1; then
             PY311=$(command -v python3.11 2>/dev/null || true)
             [[ -n "$PY311" ]] && log_ok "  python3.11 installed via deadsnakes PPA"
         else
             log_warn "  apt-get install failed — showing output:"
-            apt-get install -y python3.11 python3.11-venv python3.11-dev \
+            apt-get -o Acquire::ForceIPv4=true install -y python3.11 python3.11-venv python3.11-dev \
                 2>&1 | head -25 || true
         fi
     fi
@@ -298,14 +298,14 @@ if [[ -z "$PY311" ]]; then
         fi
     fi
 
-    apt-get update -y -q > /dev/null 2>&1
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=5 -o Acquire::https::Timeout=5 -o Acquire::Retries=1 update -y -q > /dev/null 2>&1
 
     # Same candidate check for the add-apt-repository fallback path
     AAR_CANDIDATE=$(apt-cache policy python3.11 2>/dev/null \
         | grep "Candidate:" | awk '{print $2}')
     if [[ -n "$AAR_CANDIDATE" && "$AAR_CANDIDATE" != "(none)" ]]; then
         log_ok "  Candidate found via add-apt-repository: $AAR_CANDIDATE"
-        apt-get install -y -q \
+        apt-get -o Acquire::ForceIPv4=true install -y -q \
             python3.11 python3.11-venv python3.11-dev > /dev/null 2>&1 || true
     else
         log_warn "  add-apt-repository fallback: still no candidate — will compile from source"
@@ -319,7 +319,7 @@ if [[ -z "$PY311" ]]; then
     log_warn "This will take approximately 8–10 minutes. Please wait..."
 
     # Build deps deferred here so the happy path stays fast
-    apt-get install -y -q \
+    apt-get -o Acquire::ForceIPv4=true install -y -q \
         build-essential libssl-dev libffi-dev \
         zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
         libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
@@ -362,8 +362,8 @@ fi  # end outer [[ -n PY311 ]] guard
 # Ensure venv module is present (deadsnakes splits it as a sub-package)
 if ! python3.11 -m venv --help > /dev/null 2>&1; then
     log_info "Installing python3.11-venv..."
-    apt-get install -y -q python3.11-venv > /dev/null 2>&1 \
-        || apt-get install -y -q python3-venv > /dev/null 2>&1 || true
+    apt-get -o Acquire::ForceIPv4=true install -y -q python3.11-venv > /dev/null 2>&1 \
+        || apt-get -o Acquire::ForceIPv4=true install -y -q python3-venv > /dev/null 2>&1 || true
 fi
 
 log_ok "Python 3.11 ready: $(python3.11 --version 2>&1)"
